@@ -67,8 +67,8 @@ final class ThrottleAdmissionPolicy implements WorkloadGroupAdmissionPolicy {
      * Whether this request's parent task is already counted against a throttle bucket, so admission charges it
      * nothing (see {@link WorkloadGroupService#acquireThrottlePermit}); a nested coordinator search issued during rewrite
      * would otherwise make the request compete with itself. Only the immediate, local parent is inspected: the rewrite
-     * client is the only thing that parents a counted coordinator search, and {@code TransportSearchAction} parents rewrite
-     * searches on a task only when that task is counted, so a counted ancestor is always the immediate parent. Non-search
+     * client and the node-local rewrite context parent nested searches only when that task is counted, so a counted
+     * ancestor is always the immediate parent. Non-search
      * parents (an {@code _msearch} task, a reindex task) never carry the flag, so their child searches are each charged, as
      * intended. Remote parents are skipped because {@code TaskManager#getTask} is node-local.
      */

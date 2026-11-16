@@ -20,22 +20,29 @@ import org.opensearch.action.search.CreatePitAction;
 import org.opensearch.action.search.CreatePitRequest;
 import org.opensearch.action.search.DeletePitAction;
 import org.opensearch.action.search.DeletePitRequest;
+import org.opensearch.action.search.SearchAdmission;
 import org.opensearch.action.search.SearchRequestBuilder;
 import org.opensearch.action.search.SearchRequestStats;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.action.support.ActionFilter;
 import org.opensearch.action.support.ActionFilterChain;
 import org.opensearch.action.support.ActionRequestMetadata;
+import org.opensearch.action.support.PlainActionFuture;
 import org.opensearch.action.support.WriteRequest;
 import org.opensearch.cluster.metadata.WorkloadGroup;
 import org.opensearch.common.action.ActionFuture;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
 import org.opensearch.core.rest.RestStatus;
+import org.opensearch.core.tasks.TaskId;
+import org.opensearch.index.query.MatchAllQueryBuilder;
+import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryBuilders;
+import org.opensearch.index.query.QueryRewriteContext;
 import org.opensearch.indices.TermsLookup;
 import org.opensearch.plugin.wlm.rule.WorkloadGroupFeatureType;
 import org.opensearch.plugins.ActionPlugin;
@@ -58,6 +65,7 @@ import org.opensearch.search.builder.PointInTimeBuilder;
 import org.opensearch.search.lookup.LeafFieldsLookup;
 import org.opensearch.tasks.Task;
 import org.opensearch.test.OpenSearchIntegTestCase;
+import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.Client;
 import org.opensearch.wlm.MutableWorkloadGroupFragment;
 import org.opensearch.wlm.ResourceType;
@@ -79,7 +87,9 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.function.ToLongFunction;
 
@@ -510,6 +520,14 @@ public class WlmNodeThrottlingIT extends OpenSearchIntegTestCase {
     }
 
     public void testNestedRewriteSearchIsNotChargedASecondPermit() throws Exception {
+        assertNestedRewriteSearchIsNotChargedASecondPermit(false);
+    }
+
+    public void testPluginClientNestedRewriteSearchIsNotChargedASecondPermit() throws Exception {
+        assertNestedRewriteSearchIsNotChargedASecondPermit(true);
+    }
+
+    private void assertNestedRewriteSearchIsNotChargedASecondPermit(boolean pluginClient) throws Exception {
         String workloadGroupId = "wlm_nested_group";
         String ruleId = "wlm_nested_rule";
         String indexName = "orders";
@@ -567,27 +585,38 @@ public class WlmNodeThrottlingIT extends OpenSearchIntegTestCase {
         int throttledBefore = getThrottled(workloadGroupId);
 
         // A terms lookup with a subquery runs a nested search during rewrite; the outer request already paid.
-        TermsLookup lookup = new TermsLookup(lookupIndex, null, "uid", QueryBuilders.matchAllQuery());
-        SearchResponse response = client().prepareSearch(indexName)
-            .setQuery(QueryBuilders.termsLookupQuery("field", lookup))
-            .execute()
-            .actionGet(TIMEOUT);
+        Client lookupClient = pluginClient ? internalCluster().getInstance(Client.class) : null;
+        SearchResponse response = executeWithoutRewriteContext(
+            client().prepareSearch(indexName).setQuery(lookupQuery(lookupClient, "field", lookupIndex, QueryBuilders.matchAllQuery()))
+        );
         assertEquals(RestStatus.OK, response.status());
         assertEquals("a nested rewrite search must not be counted as throttled", throttledBefore, getThrottled(workloadGroupId));
 
         // Two levels: the exempt middle search must pass its parent's charge on to the grandchild.
-        TermsLookup innerLookup = new TermsLookup(secondLookupIndex, null, "uid", QueryBuilders.matchAllQuery());
-        TermsLookup outerLookup = new TermsLookup(lookupIndex, null, "uid", QueryBuilders.termsLookupQuery("uid", innerLookup));
-        SearchResponse twoLevel = client().prepareSearch(indexName)
-            .setQuery(QueryBuilders.termsLookupQuery("field", outerLookup))
-            .execute()
-            .actionGet(TIMEOUT);
+        QueryBuilder innerLookup = lookupQuery(lookupClient, "uid", secondLookupIndex, QueryBuilders.matchAllQuery());
+        SearchResponse twoLevel = executeWithoutRewriteContext(
+            client().prepareSearch(indexName).setQuery(lookupQuery(lookupClient, "field", lookupIndex, innerLookup))
+        );
         assertEquals(RestStatus.OK, twoLevel.status());
         assertEquals(
             "no level of one request's own nested rewrite may be counted as throttled",
             throttledBefore,
             getThrottled(workloadGroupId)
         );
+
+        if (pluginClient) {
+            Exception failure = expectThrows(
+                Exception.class,
+                () -> executeWithoutRewriteContext(
+                    client().prepareSearch(indexName)
+                        .setQuery(lookupQuery(lookupClient, "field", "missing_lookup_index", QueryBuilders.matchAllQuery()))
+                )
+            );
+            assertTrue("expected the lookup index failure, got " + failure, failure.getMessage().contains("missing_lookup_index"));
+            assertEquals(throttledBefore, getThrottled(workloadGroupId));
+            // Both successful and failed rewrites must release the only permit.
+            assertEquals(RestStatus.OK, executeWithoutRewriteContext(client().prepareSearch(indexName)).status());
+        }
 
         // A genuinely concurrent request is still rejected, so the exemption didn't disable throttling.
         List<ScriptedBlockPlugin> plugins = initBlockFactory();
@@ -606,6 +635,52 @@ public class WlmNodeThrottlingIT extends OpenSearchIntegTestCase {
             disableBlocks(plugins);
         }
         assertNotNull(blocked.actionGet(TIMEOUT));
+        assertEquals(RestStatus.OK, executeWithoutRewriteContext(client().prepareSearch(indexName)).status());
+    }
+
+    private SearchResponse executeWithoutRewriteContext(SearchRequestBuilder search) {
+        ThreadContext threadContext = internalCluster().getInstance(ThreadPool.class).getThreadContext();
+        AtomicReference<TaskId> completionParent = new AtomicReference<>();
+        PlainActionFuture<SearchResponse> future = PlainActionFuture.newFuture();
+        search.execute(ActionListener.wrap(response -> {
+            completionParent.set(threadContext.getTransient(SearchAdmission.REWRITE_PARENT_TASK_ID));
+            future.onResponse(response);
+        }, e -> {
+            completionParent.set(threadContext.getTransient(SearchAdmission.REWRITE_PARENT_TASK_ID));
+            future.onFailure(e);
+        }));
+        try {
+            return future.actionGet(TIMEOUT);
+        } finally {
+            assertNull("rewrite parent must not leak to the request's completion listener", completionParent.get());
+            assertNull("rewrite parent must not leak to the caller", threadContext.getTransient(SearchAdmission.REWRITE_PARENT_TASK_ID));
+        }
+    }
+
+    private QueryBuilder lookupQuery(Client pluginClient, String field, String index, QueryBuilder query) {
+        if (pluginClient == null) {
+            return QueryBuilders.termsLookupQuery(field, new TermsLookup(index, null, "uid", query));
+        }
+        // Models a plugin that captured the node client at initialization instead of using the supplied rewrite client.
+        AtomicBoolean completed = new AtomicBoolean();
+        QueryBuilder pending = new MatchAllQueryBuilder() {
+            @Override
+            protected QueryBuilder doRewrite(QueryRewriteContext context) {
+                return completed.get() ? QueryBuilders.matchAllQuery() : this;
+            }
+        };
+        return new MatchAllQueryBuilder() {
+            @Override
+            protected QueryBuilder doRewrite(QueryRewriteContext context) {
+                context.registerAsyncAction((rewriteClient, listener) -> pluginClient.threadPool().generic().execute(() -> {
+                    pluginClient.prepareSearch(index).setQuery(query).execute(ActionListener.wrap(response -> {
+                        completed.set(true);
+                        listener.onResponse(null);
+                    }, listener::onFailure));
+                }));
+                return pending;
+            }
+        };
     }
 
     private SearchRequestBuilder blockingSearch(String indexName) {

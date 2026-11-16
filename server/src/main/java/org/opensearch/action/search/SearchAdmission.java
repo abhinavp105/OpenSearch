@@ -29,6 +29,9 @@ public interface SearchAdmission {
     /** The permit for a request admitted without being charged against any limit. */
     Releasable NOOP_PERMIT = () -> {};
 
+    /** Node-local parent task for searches issued during a throttle-counted search's query rewrite. */
+    String REWRITE_PARENT_TASK_ID = "search_rewrite_parent_task_id";
+
     /**
      * Whether requests currently need admission. While {@code false}, {@link SearchExecutionGate#execute} runs each request
      * directly and never calls {@link #admit}. Read on every search, so it must be cheap; it may change at any time.

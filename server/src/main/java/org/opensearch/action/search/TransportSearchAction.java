@@ -44,6 +44,7 @@ import org.opensearch.action.admin.cluster.shards.ClusterSearchShardsResponse;
 import org.opensearch.action.search.pruning.FieldDomainEvaluationContext;
 import org.opensearch.action.search.pruning.SearchIndexPruningResult;
 import org.opensearch.action.support.ActionFilters;
+import org.opensearch.action.support.ContextPreservingActionListener;
 import org.opensearch.action.support.HandledTransportAction;
 import org.opensearch.action.support.IndicesOptions;
 import org.opensearch.action.support.TimeoutTaskCancellationUtility;
@@ -67,6 +68,7 @@ import org.opensearch.common.settings.Setting.Property;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.concurrent.AtomicArray;
 import org.opensearch.common.util.concurrent.CountDown;
+import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.Strings;
 import org.opensearch.core.common.breaker.CircuitBreaker;
@@ -77,6 +79,7 @@ import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.indices.breaker.CircuitBreakerService;
 import org.opensearch.core.tasks.TaskId;
 import org.opensearch.index.fielddomain.ClusterStateFieldDomainProvider;
+import org.opensearch.index.query.QueryRewriteContext;
 import org.opensearch.index.query.Rewriteable;
 import org.opensearch.indices.IndicesService;
 import org.opensearch.search.SearchPhaseResult;
@@ -602,16 +605,32 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
                 if (sr.source() == null) {
                     rewriteListener.onResponse(sr.source());
                 } else {
-                    Rewriteable.rewriteAndFetch(
-                        sr.source(),
-                        // Parent rewrite searches on this task only when it is counted, so a nested search isn't charged twice.
-                        searchService.getRewriteContext(
-                            timeProvider::getAbsoluteStartMillis,
-                            searchRequest,
-                            isThrottleCounted(task) ? localTaskId(task) : TaskId.EMPTY_TASK_ID
-                        ),
-                        rewriteListener
+                    final ThreadContext threadContext = threadPool.getThreadContext();
+                    final TaskId rewriteParent = isThrottleCounted(task) ? localTaskId(task) : TaskId.EMPTY_TASK_ID;
+                    final QueryRewriteContext rewriteContext = searchService.getRewriteContext(
+                        timeProvider::getAbsoluteStartMillis,
+                        searchRequest,
+                        rewriteParent
                     );
+                    if (rewriteParent.isSet() == false && threadContext.getTransient(SearchAdmission.REWRITE_PARENT_TASK_ID) == null) {
+                        Rewriteable.rewriteAndFetch(sr.source(), rewriteContext, rewriteListener);
+                        return;
+                    }
+                    final ActionListener<SearchSourceBuilder> completionListener = ContextPreservingActionListener.wrapPreservingContext(
+                        rewriteListener,
+                        threadContext
+                    );
+                    // Plugin-owned clients also need the counted parent, not only the client supplied by the rewrite context.
+                    // Restore the caller's context before later phases run or the response listener is notified.
+                    try (
+                        ThreadContext.StoredContext ignored = threadContext.newStoredContext(
+                            true,
+                            List.of(SearchAdmission.REWRITE_PARENT_TASK_ID)
+                        )
+                    ) {
+                        threadContext.putTransient(SearchAdmission.REWRITE_PARENT_TASK_ID, rewriteParent);
+                        Rewriteable.rewriteAndFetch(sr.source(), rewriteContext, completionListener);
+                    }
                 }
             }, listener::onFailure);
             try {

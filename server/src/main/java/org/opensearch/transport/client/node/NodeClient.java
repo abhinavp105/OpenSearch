@@ -35,6 +35,8 @@ package org.opensearch.transport.client.node;
 import org.opensearch.action.ActionModule.DynamicActionRegistry;
 import org.opensearch.action.ActionRequest;
 import org.opensearch.action.ActionType;
+import org.opensearch.action.search.SearchAdmission;
+import org.opensearch.action.search.SearchRequest;
 import org.opensearch.action.search.SearchRequestBuilder;
 import org.opensearch.action.support.TransportAction;
 import org.opensearch.cluster.node.DiscoveryNode;
@@ -43,6 +45,7 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
+import org.opensearch.core.tasks.TaskId;
 import org.opensearch.tasks.Task;
 import org.opensearch.tasks.TaskListener;
 import org.opensearch.threadpool.ThreadPool;
@@ -110,6 +113,7 @@ public class NodeClient extends AbstractClient {
         Request request,
         ActionListener<Response> listener
     ) {
+        assignRewriteParent(request);
         return transportAction(action).execute(request, listener);
     }
 
@@ -122,7 +126,17 @@ public class NodeClient extends AbstractClient {
         Request request,
         TaskListener<Response> listener
     ) {
+        assignRewriteParent(request);
         return transportAction(action).execute(request, listener);
+    }
+
+    private void assignRewriteParent(ActionRequest request) {
+        if (request instanceof SearchRequest && request.getParentTask().isSet() == false) {
+            TaskId parentTask = threadPool().getThreadContext().getTransient(SearchAdmission.REWRITE_PARENT_TASK_ID);
+            if (parentTask != null) {
+                request.setParentTask(parentTask);
+            }
+        }
     }
 
     /**
